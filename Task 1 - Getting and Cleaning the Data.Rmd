@@ -1,0 +1,149 @@
+---
+title: '<hr/>Johns Hopkins Univeristy Data Science Capstone<br/>Task 1 - Getting and Cleaning the Data<hr/>'
+author: "Richard Allen"
+date: "`r Sys.Date()`<hr/>"
+output: 
+  html_document: 
+    fig_width: 10
+    fig_height: 6
+    highlight: pygments
+    theme: yeti
+    toc: yes
+    number_sections: yes
+---
+
+------------------------------------------------------------------------
+
+```{r setup, echo = FALSE}
+# set defaults: cache chunks to speed compiling subsequent edits.
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	echo = TRUE
+)
+```
+
+```{r library}
+require(tidyverse)
+require(quanteda)
+```
+
+# Downloading the Data
+
+```{r download, eval=FALSE}
+# create data directory if it doesn't exist
+if (!dir.exists("./data")) {
+  dir.create("./data")
+}
+
+# download and unzip course data file
+zipURL <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+download.file(zipURL, dest="SwiftKey.zip", mode="wb") 
+unzip ("SwiftKey.zip", exdir = "./data")
+
+# download english profanity list from github and save to en-US folder
+url<- 'https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en'
+download(url, dest="./data/final/en_US/profanity.txt") 
+```
+
+# Load Data
+
+```{r load-data}
+# load just the English data for analysis
+news <- as_tibble(read_lines('./data/final/en_US/en_US.blogs.txt',
+                             skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'news')
+blogs <- as_tibble(read_lines('./data/final/en_US/en_US.blogs.txt',
+                              skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'blog')
+tweets <- as_tibble(read_lines('./data/final/en_US/en_US.blogs.txt',
+                               skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'twitter')
+
+all_text <- rbind(news, blogs, tweets)
+
+# load profanity list
+profanityList <- as_tibble(read_lines('./data/final/en_US/profanity.txt')) %>%
+    rename(word = value)
+```
+
+# Create Sample Set
+
+Each source has `r nrow(news)` observations, create an even split of 5% samples from each source and combine.
+
+```{r sample}
+set.seed(1234)
+size <- round(nrow(news) * 0.05)
+text_sample <- rbind(
+    sample_n(news, size),
+    sample_n(blogs, size),
+    sample_n(tweets, size)
+)
+```
+
+The sample set consists of `r nrow(text_sample)` observations.
+
+------------------------------------------------------------------------
+
+# Tokenization
+
+The `quanteda` package will be used for processing the sample text.
+
+## Corpus
+
+Create the corpus.
+
+```{r corpus}
+corp_text <- corpus(
+    text_sample$text, 
+    docvars = data.frame(Source=text_sample$source)
+    )
+```
+
+## Create Tokens
+
+Create two sets, with and without stop words. Filter for profanity first. Remove punctuation, URL's, numbers and symbols when creating token object. Without stop words is useful for analysis, however they will be needed for text prediction later on.
+
+```{r tokenisation}
+toks_text <- tokens(corp_text, remove_punct = T, remove_symbols = T, 
+                    remove_numbers = T, remove_url = T)
+toks_text <- tokens_select(toks_text, pattern = profanityList$word, 
+                           selection = "remove")
+head(toks_text,6)
+
+toks_text_no_stop <- tokens_select(toks_text, pattern = stopwords("en"), 
+                           selection = "remove")
+head(toks_text_no_stop,6)
+```
+
+Credit for the Profanity List goes to the [LDNOOBW project](https://github.com/LDNOOBW).
+
+# Save Data
+
+Save all useful objects for use later.
+
+```{r savedata}
+# create processed data directory if it doesn't exist
+if (!dir.exists("./data/processed")) {
+  dir.create("./data/processed")
+}
+
+save (
+    all_text,
+    text_sample,
+    corp_text,
+    toks_text,
+    toks_text_no_stop,
+    file = './data/processed/project.Rdata'
+)
+```
+
+\
+\
+\
+
+\
