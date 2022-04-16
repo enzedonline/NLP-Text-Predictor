@@ -1,0 +1,471 @@
+---
+title: '<hr/>Johns Hopkins Univeristy Data Science Capstone<br/>Task 2 - Exploratory Data Analysis<hr/>'
+author: "Richard Allen"
+date: "`r Sys.Date()`<hr/>"
+output: 
+  html_document: 
+    fig_width: 10
+    fig_height: 6
+    highlight: pygments
+    theme: yeti
+    toc: yes
+    number_sections: yes
+bibliography: references.bib
+---
+
+------------------------------------------------------------------------
+
+```{r setup, echo = FALSE}
+# set defaults: cache chunks to speed compiling subsequent edits.
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	echo = TRUE
+)
+```
+
+```{r library}
+require(tidyverse)
+require(tidytext)
+require(quanteda)
+require(quanteda.textstats)
+require(quanteda.textplots)
+require(igraph)
+require(ggraph)
+require(skimr)
+require(RColorBrewer)
+require(ggwordcloud)
+require(kableExtra)
+```
+
+# Read Data
+
+```{r read-data}
+load('./data/processed/project.Rdata')
+```
+
+# Create Document Format Matrices
+
+Create one each for with and without stop words.
+
+```{r dfm}
+dfmat <- dfm(toks_text)
+dfmat_ns <- dfm(toks_text_no_stop)
+```
+
+# Corpus
+
+## Structure
+
+Analyse observation structure by source
+
+```{r corpus}
+summ <- summary(corp_text, nrow(text_sample)) %>% 
+    rename(Words=Tokens)
+summ %>%
+    group_by(Source) %>%
+    select(-Text, -Types) %>%
+    skim()
+```
+
+There is very little difference in the distribution of words and sentences between the three sources until the upper quantile.
+
+## Distribution of Word Count
+
+```{r wc_dist1}
+g <- summ %>% ggplot(aes(x = Words)) +
+    geom_histogram(bins = 100, fill="orange", colour="#ff8c00", alpha = 0.8) +
+    theme_minimal() +
+    ylab(NULL) +
+    ggtitle("Distribution of Word Count")
+g
+```
+
+Distribution of word count is strongly exponential.
+
+```{r wc_dist2}
+g + geom_line(
+        aes(y = 4200*(..density..), colour = "red"), 
+        stat = 'density', 
+        size = 1.5, 
+        alpha = 0.8) + 
+    theme(legend.position = "none") +
+    scale_x_log10() +
+    ggtitle("Log Base 10 Distribution of Word Count") 
+```
+
+Log of word count normalises the distribution somewhat though the distribution is bimodal with peaks at around 5 & 60 words.
+
+## Most Common Words
+
+```{r common_words}
+word_freq <- textstat_frequency(dfmat_ns)
+as.data.frame(word_freq) %>% 
+    select(feature, frequency) %>%
+    slice_max(order_by = frequency, n=40) %>%
+    ggplot(aes(x=frequency, y=fct_reorder(feature, frequency))) +
+    geom_col(fill="orange", colour="#ff8c00", alpha = 0.8) +
+    theme_minimal() +
+    ylab(NULL) +
+    ggtitle("40 Most Common Words in the Sample Data Set (Stop Words Removed)") 
+```
+
+Wordcloud (stop words removed)
+
+```{r wordcloud}
+as.data.frame(word_freq) %>% 
+    select(feature, frequency) %>%
+    slice_max(order_by = frequency, n = 200) %>%
+    ggplot(aes(label = feature, size = frequency, colour = frequency)) + 
+    geom_text_wordcloud_area(eccentricity = 2, shape = 'square') +
+    scale_size_area(max_size = 20) +
+    theme_void() +
+    scale_colour_viridis_c()
+```
+
+# N-gram Analysis
+
+## Create a list of bigrams and trigrams.
+
+```{r ngram, comment=""}
+toks_ngram <- tokens_ngrams(toks_text, n = 2:3)
+# list ngrams for first 10 documents
+for (i in 1:10) {
+    print(head(toks_ngram[[i]],8))
+}
+
+# Create n-grams without stop words
+toks_ngram_ns <- tokens_ngrams(toks_text_no_stop, n = 2:3)
+# list ngrams for first 10 documents
+for (i in 1:10) {
+    print(head(toks_ngram[[i]],8))
+}
+```
+
+## Frequency of n-grams
+
+```{r ngram-freq, comment=""}
+# Create DFM's
+dfmat_ngram <- dfm(toks_ngram)
+dfmat_ngram_ns <- dfm(toks_ngram_ns)
+
+# Create frequency lists, separate words
+ngram_freq <- as.data.frame(textstat_frequency(dfmat_ngram)) %>% 
+    filter(frequency > 40) %>% 
+    select(feature, frequency) %>%
+    separate(feature, c("word1", "word2", "word3"), sep = "_") 
+
+ngram_freq_ns <- as.data.frame(textstat_frequency(dfmat_ngram_ns)) %>% 
+    filter(frequency > 25) %>% 
+    select(feature, frequency) %>%
+    separate(feature, c("word1", "word2", "word3"), sep = "_") 
+
+#Top 40 ngrams
+cbind(
+    ngram_freq %>% filter(is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F) %>% select(-word3),
+    ngram_freq_ns %>% filter(is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F) %>% select(-word3),
+    ngram_freq %>% filter(!is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F),
+    ngram_freq_ns %>% filter(!is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F)
+) %>%
+    kbl() %>%
+    column_spec (c(4,7,11), extra_css = "padding-left: 20px;border-left-style: solid;border-color: lightgrey;") %>%
+    column_spec (c(3,6,10), extra_css = "padding-right: 20px;") %>%
+    kable_styling(full_width = T, font_size = 11, bootstrap_options = c("striped", "condensed")) %>%
+    add_header_above(
+            c(
+                "Bigrams with Stopwords" = 3, 
+                "Bigrams w/o Stopwords" = 3,
+                "Trigrams with Stopwords" = 4, 
+                "Trigrams w/o Stopwords" = 4
+            )
+        )
+```
+
+-   Bigrams have a much higher frequency than trigrams (top trigram counts are approximately 10% of those for bigrams).
+-   N-grams without stopwords have a much lower frequency, particularly trigrams where the highest score (ignoring proper nouns) occurred only 58 times in 135,000 observations (0.04%).
+
+## Relationships Between Words in Bigrams
+
+Plot connections between words with and without stopwords.
+
+```{r plot-ngrams}
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+#create map edges
+ngram_graph <- ngram_freq %>%
+    filter(frequency > 2000) %>%
+    graph_from_data_frame()
+ngram_graph_ns <- ngram_freq_ns %>%
+    filter(frequency > 150) %>%
+    graph_from_data_frame()
+
+ngram_graph
+ngram_graph_ns
+
+set.seed(1234)
+
+g <- ggraph(ngram_graph, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = frequency), show.legend = FALSE,
+                   arrow = a, end_cap = circle(.07, 'inches')) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+
+g_ns <- ggraph(ngram_graph_ns, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = frequency), show.legend = FALSE,
+                   arrow = a, end_cap = circle(.07, 'inches')) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+
+g;g_ns
+```
+
+# Feature Co-occurrence Matrix (FCM)
+
+A more useful analysis is to use Collocation Frequency which analyses co-occurrence of words within the document (as opposed to n-grams which only considers adjacent words).
+
+```{r collocation}
+collocation_freq <- toks_text %>% textstat_collocations(min_count = 200)
+collocation_freq %>% slice_max(order_by = count, n=40)
+
+collocation_freq_ns <- toks_text_no_stop %>% textstat_collocations(min_count = 200)
+collocation_freq_ns %>% slice_max(order_by = count, n=40)
+```
+
+As expected, stop words rate the highest.
+
+Create FCM's
+
+```{r fcm}
+fcmat <- fcm(dfmat)
+topfeatures(fcmat,20)
+fcmat_ns <- fcm(dfmat_ns)
+topfeatures(fcmat_ns,20)
+```
+
+Plot relationship between words:
+
+```{r fcm_plot}
+set.seed(1234)
+feat <- names(topfeatures(fcmat, 50))
+fcmat_select <- fcm_select(fcmat, pattern = feat, selection = "keep")
+size <- log(colSums(dfm_select(dfmat, feat, selection = "keep")))
+textplot_network(fcmat_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+feat <- names(topfeatures(fcmat_ns, 50))
+fcmat_select <- fcm_select(fcmat_ns, pattern = feat, selection = "keep")
+size <- log(colSums(dfm_select(dfmat_ns, feat, selection = "keep")))
+textplot_network(fcmat_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+```
+
+# Term Frequency - Inverse Document Frequency (TF-IDF)
+
+The statistic tf-idf is intended to measure how important a word is to a document in a collection (or corpus) of documents, for example, to one novel in a collection of novels or to one website in a collection of websites.
+
+## Term Frequency Calculation
+
+Look at data split by source to see if there is much change in word importance.
+
+```{r tf, fig.height=3}
+data(stop_words)
+
+profanityList <- as_tibble(read_lines('./data/final/en_US/profanity.txt')) %>%
+    rename(word = value)
+
+tokens <- text_sample %>%
+    unnest_tokens(word, text) %>%
+    mutate(word = str_replace(word, "’", "'")) %>%
+    filter(is.na(suppressWarnings(as.numeric(word)))) %>%
+    anti_join(profanityList)
+
+tokens_ns <- tokens %>%
+    anti_join(stop_words)
+
+source_words <- tokens %>% count(source, word, sort = T)
+source_words_ns <- tokens_ns %>% count(source, word, sort = T)
+
+source_total <- source_words %>% group_by(source) %>% summarise(total = sum(n))
+source_total_ns <- source_words_ns %>% group_by(source) %>% summarise(total = sum(n))
+
+source_words <- left_join(source_words, source_total)
+source_words_ns <- left_join(source_words_ns, source_total_ns)
+
+gg.tf <- ggplot(source_words, aes(n/total, fill = source)) +
+    geom_histogram(show.legend = FALSE, bins=25) +
+    facet_wrap(~source, ncol = 3, scales = "free_y") +
+    scale_x_log10(limits=c(NA, 0.0009)) +
+    ggtitle("Term Frequency Distribution by Source (Log Base 10 Scale)") +
+    theme_minimal()
+
+gg.tfns <- ggplot(source_words_ns, aes(n/total, fill = source)) +
+    geom_histogram(show.legend = FALSE, bins=25) +
+    facet_wrap(~source, ncol = 3, scales = "free_y") +
+    scale_x_log10(limits=c(NA, 0.0009)) + 
+    ggtitle("Term Frequency without Stop Words Distribution by Source (Log Base 10 Scale)") +
+    theme_minimal()
+
+gg.tf; gg.tfns;
+```
+
+## Zipf's law
+
+Zipf's law states that the frequency that a word appears is inversely proportional to its rank.
+
+```{r zipf}
+freq_by_rank <- source_words %>% 
+    group_by(source) %>% 
+    mutate(rank = row_number(), 
+           `term frequency` = n/total) %>%
+    ungroup()
+
+freq_by_rank_ns <- source_words %>% 
+    group_by(source) %>% 
+    mutate(rank = row_number(), 
+           `term frequency` = n/total) %>%
+    ungroup()
+
+freq_by_rank %>% 
+    ggplot(aes(rank, `term frequency`, colour=source)) + 
+    geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+    scale_x_log10() +
+    scale_y_log10() +
+    theme_minimal()
+```
+
+Plots for the three sources are nearly identical.
+
+There is a near log-linear relationship over much of the distribution as predicted by Zipf's Law.
+
+Find the relationship for ranks from 10 to 10000:
+
+```{r zipf-lm}
+rank_subset <- freq_by_rank %>% 
+    filter(rank < 10000,
+           rank > 10)
+
+zipflm <- coef(lm(log10(`term frequency`) ~ log10(rank), data = rank_subset))
+zipflm
+
+freq_by_rank %>% 
+    ggplot(aes(rank, `term frequency`, colour=source)) + 
+    geom_abline(intercept = zipflm[1], slope = zipflm[2], 
+                color = "gray50", linetype = 2) +
+    geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+    scale_x_log10() +
+    scale_y_log10() +
+    theme_minimal()
+```
+
+Find Words with Highest TF-IDF Score
+
+```{r tf-idf}
+source_tf_idf <- source_words %>%
+    bind_tf_idf(word, source, n)
+
+source_tf_idf %>%
+    group_by(source) %>%
+    slice_max(tf_idf, n = 25) %>%
+    ungroup() %>%
+    ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = source)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~source, ncol = 3, scales = "free") +
+    labs(x = "tf-idf", y = NULL)
+
+```
+
+# Analysing Language
+
+Load the English dictionary from the hunspell package and filter by dictionary words only. Calculate percentage of sampled words also found in the English dictionary, calculate percentage of dictionary words captured by the sample.
+
+```{r en-dict}
+# read US English Dictinary
+english_words <- readLines("./data/dict/en_US.dic") %>% gsub("/.+", "", .)
+n_dict <- length(english_words)
+
+# filter DFM by English US dictionary words
+dfmat_en <- toks_text %>%
+    tokens_keep(english_words, valuetype = "fixed") %>% 
+    dfm()
+
+# Use text stat frequency to obtain a list of unique words
+word_freq <- textstat_frequency(dfmat)
+word_freq_en <- textstat_frequency(dfmat_en)
+
+# Proportion of sample in US English dictionary
+nrow(word_freq_en)/nrow(word_freq)
+
+# Proportion of US English dictionary words captured in sample
+nrow(word_freq_en)/n_dict
+```
+
+Only 24% of words in the sample are recognised in the US English dictionary. The remaining 76% will be a mixture of foreign words, abbreviations, shorthand, mispellings and unrecognised slang. Determining the proportion of these that are actually foreign words would require a significant amount of processing.
+
+63% of the words appearing in the US English dictionary are captured by a 5% sample. To capture 90% of vocabulary would likely require a far greater sample as frequency of usage of remaining words becomes increasingly rare.
+
+Everyday words are a much smaller subset of the full dictionary vocabulary however.
+
+> "In English, for example, 3000 words make up about 95% of everyday conversation"[^1]
+
+[^1]: <https://www.fluentu.com/blog/how-many-words-do-i-need-to-know/>
+
+There are `r nrow(word_freq_en)` US English words captured in the sample. Using 3000 as an estimate of common usage vocabulary, it is very likely that all are captured by the sample.
+
+Using the [Top 3000 Words list from Education First](https://www.ef.co.uk/english-resources/english-vocabulary/top-3000-words/):
+
+```{r en-common}
+# read English common usage Dictinary
+common_words <- readLines("./data/dict/en_common.dic") %>% gsub("/.+", "", .)
+
+# filter DFM by common English words
+dfmat_common <- toks_text %>%
+    tokens_keep(common_words, valuetype = "fixed") %>% 
+    dfm()
+
+# Use text stat frequency to obtain a list of unique words
+word_freq_common <- textstat_frequency(dfmat_common)
+
+# Proportion of sample in common usage list
+nrow(word_freq_common)/nrow(word_freq)
+
+# Proportion of common usage words captured in sample
+nrow(word_freq_common)/length(common_words)
+```
+
+The 5% sample captures 99.9% of common usage words, but only 2.3% of the content is common usage.
+
+Estimate required sample size to meet common vocabulary coverage. Rather than look at the required number of words to be sampled, use the document frequency count to estimate the number of documents (observations) that would need to be sampled to achieve coverage.
+
+```{r coverage}
+token_coverage <- function(word_cover) {  
+    count <- 0 
+    coverage <- word_cover * sum(word_freq_common$docfreq) 
+    for (n in 1:nrow(word_freq_common)) { 
+        if (count >= coverage) {
+            return (n)
+        } else {
+            count <- count + word_freq_common$docfreq[n]
+        }
+    }
+}
+
+# Estimate number of observations required to sample 50% of common words
+token_coverage(.5)
+# Estimate number of observations required to sample 90% of common words
+token_coverage(.9)
+
+token_coverage_v <- Vectorize(token_coverage)
+tibble(Coverage = seq(0.05, 0.95, by = 0.05)) %>%
+    mutate(Samples = token_coverage_v(Coverage)) %>%
+    ggplot(aes(x=100*Coverage, y=Samples)) +
+    geom_point(colour="blue", size=3) +
+    geom_smooth(method = "loess", se = FALSE, span=0.4) +
+    theme_minimal() +
+    ylab("Required Sample Size") + xlab("Coverage (%)") +
+    ggtitle("Samples Required to Meet Common Vocabulary Coverage") +
+    geom_vline(xintercept = c(50,90), linetype="dashed", alpha=0.7)
+```
+
+# References
+
+[@quanteda; @tidytext]\
