@@ -396,6 +396,22 @@ nrow(word_freq_en)/nrow(word_freq)
 
 nrow(word_freq_en)/n_dict
 
+# read English common usage Dictinary
+common_words <- readLines("./data/dict/en_common.dic") %>% gsub("/.+", "", .)
+
+# filter DFM by common English words
+dfmat_common <- toks_text %>%
+    tokens_keep(common_words, valuetype = "fixed") %>% 
+    dfm()
+
+# Use text stat frequency to obtain a list of unique words
+word_freq_common <- textstat_frequency(dfmat_common)
+
+# Proportion of sample in common usage list
+nrow(word_freq_common)/nrow(word_freq)
+
+# Proportion of common usage words captured in sample
+nrow(word_freq_common)/length(common_words)
 
 token_coverage <- function(word_cover) {  
     count <- 0 
