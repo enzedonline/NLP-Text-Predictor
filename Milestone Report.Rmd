@@ -1,0 +1,939 @@
+---
+title: '<hr/>Johns Hopkins University Data Science Capstone Project<br/>Milestone Report<hr/>'
+author: "Richard Allen"
+date: "`r Sys.Date()`<hr/>"
+output: 
+  html_document: 
+    fig_width: 10
+    fig_height: 6
+    highlight: pygments
+    theme: yeti
+    toc: yes
+    number_sections: yes
+bibliography: references.bib
+---
+
+```{r setup, echo = FALSE}
+# set defaults: cache chunks to speed compiling subsequent edits.
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	echo = FALSE
+)
+```
+
+```{r 1-library, echo=FALSE}
+require(tidyverse)
+require(tidytext)
+require(quanteda)
+require(quanteda.textstats)
+require(quanteda.textplots)
+require(igraph)
+require(ggraph)
+require(kableExtra)
+require(skimr)
+require(RColorBrewer)
+require(ggwordcloud)
+```
+
+# Executive Summary
+
+The following report examines the data required for the Johns Hopkins Data Science Specialization Capstone Project and explores plans for creating a word prediction app. Of three model types trialled (Recursive Neural Network with TensorFlow, Markov Chain Prediction and Stupid Back-off), the report will find the Stupid Back-off approach to be the best performer in terms of accuracy, speed and size, and simplest to create.
+
+# Project Task
+
+Using data obtained from the coursera website representing publicly available text from twitter, news and blog sources, create a predictive text product that takes as input a phrase (multiple words) and predict the next word.
+
+# Obtaining the Data
+
+## Downloading the Source Text
+
+-   The [Coursera material](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip) is downloaded and extracted
+-   An [English profanity filter](https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en) is downloaded, required for cleaning the data.
+
+```{r 2-download, eval=FALSE}
+# create data directory if it doesn't exist
+if (!dir.exists("./data")) {
+  dir.create("./data")
+}
+
+# download and unzip course data file
+zipURL <- "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+download.file(zipURL, dest="SwiftKey.zip", mode="wb") 
+unzip ("SwiftKey.zip", exdir = "./data")
+
+# download english profanity list from github and save to en-US folder
+url<- 'https://raw.githubusercontent.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words/master/en'
+download(url, dest="./data/final/en_US/profanity.txt") 
+```
+
+## Load the data and combine the sources.
+
+This project will just look at the en_US data set:
+
+-   The three data sources are loaded and combined into a single data set
+
+```{r 3-load-data}
+# load just the English data for analysis
+news <- as_tibble(read_lines('./data/final/en_US/en_US.blogs.txt',
+                             skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'blog')
+blogs <- as_tibble(read_lines('./data/final/en_US/en_US.news.txt',
+                              skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'news')
+tweets <- as_tibble(read_lines('./data/final/en_US/en_US.twitter.txt',
+                               skip_empty_rows = T)) %>%
+    rename(text = value) %>%
+    mutate(source = 'twitter')
+
+all_text <- rbind(news, blogs, tweets) %>% mutate(id = row_number())
+
+# load profanity list
+profanityList <- as_tibble(read_lines('./data/final/en_US/profanity.txt')) %>%
+    rename(word = value)
+
+rm(blogs, news, tweets)
+
+set.seed(123)
+all_text %>% sample_n(10)
+```
+
+## Initial Filter
+
+-   The blog set contains many garbage entries with less than 5 characters. Filter all text lines from the data set shorter than 5 characters.
+-   Duplicate lines are removed from the data set.
+
+```{r 4-filterU5}
+all_text <- all_text %>%
+    filter(nchar(text)>=5) %>%
+    distinct_all()
+```
+
+```{r 5-row_counts, echo=FALSE}
+n_blogs <- all_text %>% filter(source == 'blog') %>% summarise(n()) %>% pull()
+n_news <- all_text %>% filter(source == 'news') %>% summarise(n()) %>% pull()
+n_tweets <- all_text %>% filter(source == 'twitter') %>% summarise(n()) %>% pull()
+```
+
+Sample size after initial filter:
+
+-   Blogs: `r format(n_blogs, big.mark=",")`
+-   News: `r format(n_news, big.mark=",")`
+-   Twitter: `r format(n_tweets, big.mark=",")`
+
+## Create Sample Sets for Training, Testing and Validation
+
+-   Each set is taken proportionally from the source data.
+-   With `r format(nrow(all_text), big.mark=",")` rows in the combined data set, 10% is a sufficient size for training, with 5% each for testing and validation.
+
+```{r 6-create_samples}
+set.seed(1234)
+sample <- rbind(
+    all_text %>% filter(source=='news') %>% sample_frac(.2),
+    all_text %>% filter(source=='blog') %>% sample_frac(.2),
+    all_text %>% filter(source=='twitter') %>% sample_frac(.2)
+)
+
+# split sample into test and train
+train <- rbind(
+    sample %>% filter(source=='news') %>% sample_frac(.5),
+    sample %>% filter(source=='blog') %>% sample_frac(.5),
+    sample %>% filter(source=='twitter') %>% sample_frac(.5)
+)
+test_val  <- anti_join(sample, train, by = 'id')
+
+# split test_val into test and validation
+validation <- rbind(
+    test_val %>% filter(source=='news') %>% sample_frac(.5),
+    test_val %>% filter(source=='blog') %>% sample_frac(.5),
+    test_val %>% filter(source=='twitter') %>% sample_frac(.5)
+)
+test <- anti_join(test_val, validation, by = 'id')
+
+rm(sample, test_val)
+```
+
+Data set sizes:
+
+-   Training: `r format(nrow(train), big.mark=",")` rows
+-   Testing: `r format(nrow(test), big.mark=",")` rows
+-   Validation: `r format(nrow(validation), big.mark=",")` rows
+
+# Preparing the Data Sample Sets
+
+## Clean Sample
+
+The following process is performed on the subsets prepared above:
+
+1.  convert to lower-case and strip out profanity
+2.  replace smart single quote `r knitr::asis_output("\U2019")` with '
+3.  replace all sentence terminating characters with a full stop
+4.  remove all remaining punctuation except single quote and full stop
+
+```{r 7-clean-samples}
+
+replace_pattern <- '[!\\p{Pd}:;\\?…]'
+remove_pattern <- '[\\d+\\"""#$%&()\\*\\+,\\/<\\=>@\\[\\]\\^_`{\\|}~\\t\\n]'
+profanityList <- as_tibble(read_lines('./data/final/en_US/profanity.txt')) %>%
+    rename(word = value)
+
+clean_text <- function(dataset) {
+    dataset %>% 
+    mutate(text = str_remove_all(tolower(text), str_c(profanityList$word, collapse="|"))) %>%
+    mutate(text = str_replace_all(text, "’", "'")) %>%
+    mutate(text = str_replace_all(text, replace_pattern, '.')) %>%
+    mutate(text = str_remove_all(text, remove_pattern))
+}
+
+train <- clean_text(train)
+test <- clean_text(test)
+validation <- clean_text(validation)
+
+```
+
+## Save Data Sets
+
+Prepared data sets for later use in modelling.
+
+```{r 8-savedata}
+# create processed data directory if it doesn't exist
+if (!dir.exists("./data/processed")) {
+  dir.create("./data/processed")
+}
+
+save (
+    all_text,
+    train,
+    test,
+    validation,
+    file = './data/processed/project.Rdata'
+)
+```
+
+## Corpus
+
+The Quanteda package is used to create the corpus representing all the text in the sample and for all subsequent data analysis in this document.
+
+```{r 9-corpus}
+corp_text <- corpus(
+    train$text, 
+    docvars = data.frame(Source=train$source)
+    )
+```
+
+## Create Tokens
+
+Tokenisation is the process of splitting the corpus into sentences and/or words with relative frequencies.
+
+-   Two sets are created, with and without stop words. Without stop words is useful for analysis, however they will be needed for text prediction later on.
+-   A filter for profanity is applied first.
+-   URL's removed and any remaining symbols when creating the tokens.
+
+Sample token collections with and without stop words:
+
+```{r 10-tokenisation}
+set.seed(1234)
+toks_text <- tokens(corp_text, remove_punct = T, remove_symbols = T, 
+                    remove_numbers = T, remove_url = T)
+n_words <- sum(ntoken(toks_text))
+tokens_sample(toks_text, size = 6)
+
+toks_text_no_stop <- tokens_select(toks_text, pattern = stopwords("en"), 
+                           selection = "remove")
+n_words_ns <- sum(ntoken(toks_text_no_stop))
+tokens_sample(toks_text_no_stop, size = 6)
+```
+
+-   There are `r format(n_words, big.mark=",")` words in the corpus, `r format(n_words_ns, big.mark=",")` without stop words.
+
+```{r 11-dfm}
+dfmat <- dfm(toks_text)
+dfmat_ns <- dfm(toks_text_no_stop)
+```
+
+# Exploratory Data Analysis
+
+## Corpus Structure
+
+Observation word, sentence and character count by source (observations shorter than 5 characters removed)
+
+```{r 12-corpus, echo=FALSE}
+summ <- summary(corp_text, nrow(train)) %>% 
+    rename(Words=Tokens)
+
+summ %>%
+    mutate(Characters = nchar(train$text)) %>%
+    group_by(Source) %>%
+    select(-Text, -Types) %>%
+    skim_without_charts() %>%
+    select(-skim_type, -complete_rate, -n_missing) %>%
+    rename(mean=numeric.mean, sd=numeric.sd, p0=numeric.p0, p25=numeric.p25,
+           p50=numeric.p50, p75=numeric.p75, p100=numeric.p100, feature=skim_variable) %>%
+    kbl() %>% kable_styling(full_width = T, font_size = 11)
+```
+
+-   blogs and news have similar distribution in the mid range, however news word count is higher for the lower quantile while blogs is much higher for the upper two quantiles.
+-   tweets are lower for word count across all quantiles
+-   sentence distribution is similar across all formats until the upper quantile, with tweets the lowest & blogs the highest.
+-   the 140 character limitation on twitter is evident in the above table, while the blogs are also significantly longer than the news items, although the lower quantile count for news items is higher.
+
+## Distribution of Word Count
+
+```{r 13-wc_dist1, echo=FALSE}
+g <- summ %>% ggplot(aes(x = Words, fill=Source, colour=Source)) +
+    geom_histogram(bins = 100, alpha = 0.6) +
+    theme_minimal() +
+    ylab(NULL) +
+    ggtitle("Distribution of Word Count")
+g
+```
+
+Distribution of word count is strongly exponential.
+
+```{r 14-wc_dist2, echo=FALSE}
+g + geom_line(
+        aes(y = 6000*(..density..), colour = Source), 
+        stat = 'density', 
+        size = 1.5, 
+        alpha = 0.8) + 
+    scale_x_log10() +
+    ggtitle("Log Base 10 Distribution of Word Count") 
+```
+
+-   Log of word count normalises the distribution somewhat.
+-   Tweets are heavily skewed due to the 140 character limit and peak at around 14 words
+-   News shows a strong peak at around 60 words.
+-   Blogs have a greater spread and shows a main peak at around 70 words with a slight secondary peak at 8 words.
+
+## Most Common Words
+
+```{r 15-common_words, echo=FALSE}
+word_freq <- textstat_frequency(dfmat)
+unique_words <- nrow(word_freq)
+word_freq_ns <- textstat_frequency(dfmat_ns)
+unique_words_ns <- nrow(word_freq_ns)
+
+as.data.frame(word_freq_ns) %>% 
+    select(feature, frequency) %>%
+    slice_max(order_by = frequency, n=40) %>%
+    ggplot(aes(x=frequency, y=fct_reorder(feature, frequency))) +
+    geom_col(fill="orange", colour="#ff8c00", alpha = 0.8) +
+    theme_minimal() +
+    ylab(NULL) +
+    ggtitle("40 Most Common Words in the Sample Data Set (Stop Words Removed)") 
+```
+
+Looking at the size of the word count table gives us the number of unique words in the corpus:
+
+-   `r format(unique_words, big.mark=",")` unique words
+-   `r format(unique_words_ns, big.mark=",")` unique words without stop words
+
+## Wordcloud
+
+```{r 16-wordcloud, echo=FALSE}
+as.data.frame(word_freq_ns) %>% 
+    select(feature, frequency) %>%
+    slice_max(order_by = frequency, n = 200) %>%
+    ggplot(aes(label = feature, size = frequency, colour = frequency)) + 
+    geom_text_wordcloud_area(eccentricity = 2, shape = 'square') +
+    scale_size_area(max_size = 20) +
+    theme_void() +
+    scale_colour_viridis_c() + 
+    labs(caption = "Stop words removed")
+```
+
+## N-gram Analysis
+
+### Create a list of bi-grams and tri-grams.
+
+Using the following formula for combinations with repetitions:
+
+$$
+(1)\ {}_{n+r-1}C_r={\large\frac{(n+r-1)!}{r!(n-1)!}}\\
+$$
+
+We can find the possible number of n-grams for r format(unique_words, big.mark=",") unique words:
+
+-   `r format(22309373296, big.mark=",")` possible bi-grams
+-   `r format(1.5708252831447E+15, big.mark=",", scientific = FALSE)` possible tri-grams
+
+We'll look at bi-grams and tri-grams occurring in the sample for both with and without stop words keeping only those that occur frequently enough to consider (40 times with stop words & 25 times without for this analysis).
+
+Samples from the corpus:
+
+```{r 17-ngram, comment=""}
+toks_ngram <- tokens_ngrams(toks_text, n = 2:3)
+# list ngrams for first 10 documents
+for (i in 1:10) {
+    print(str_c(head(toks_ngram[[i]],8), collapse = ", "))
+}
+
+# Create n-grams without stop words
+toks_ngram_ns <- tokens_ngrams(toks_text_no_stop, n = 2:3)
+# list ngrams for first 10 documents
+for (i in 1:10) {
+    print(str_c(head(toks_ngram_ns[[i]],8), collapse = ", "))
+}
+```
+
+### Frequency of n-grams
+
+The following table displays the top 40 most frequently occurring bi-grams and tri-grams:
+
+```{r 18-ngram-freq, echo=FALSE, comment=""}
+# Create DFM's
+dfmat_ngram <- dfm(toks_ngram)
+dfmat_ngram_ns <- dfm(toks_ngram_ns)
+
+# Create frequency lists, separate words
+ngram_freq <- as.data.frame(textstat_frequency(dfmat_ngram)) %>% 
+    filter(frequency > 40) %>% 
+    select(feature, frequency) %>%
+    separate(feature, c("word1", "word2", "word3"), sep = "_") 
+
+ngram_freq_ns <- as.data.frame(textstat_frequency(dfmat_ngram_ns)) %>% 
+    filter(frequency > 25) %>% 
+    select(feature, frequency) %>%
+    separate(feature, c("word1", "word2", "word3"), sep = "_") 
+```
+
+```{r 19-ngram-table, echo=FALSE}
+# Count n-grams
+n_bigram <- ngram_freq %>% filter(is.na(word3)) %>% summarise(n())
+n_bigram_ns <- ngram_freq_ns %>% filter(is.na(word3)) %>% summarise(n())
+n_trigram <- ngram_freq %>% filter(!is.na(word3)) %>% summarise(n())
+n_trigram_ns <- ngram_freq_ns %>% filter(!is.na(word3)) %>% summarise(n())
+
+#Top 40 ngrams
+cbind(
+    ngram_freq %>% filter(is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F) %>% select(-word3),
+    ngram_freq_ns %>% filter(is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F) %>% select(-word3),
+    ngram_freq %>% filter(!is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F),
+    ngram_freq_ns %>% filter(!is.na(word3)) %>% slice_max(frequency, n=40, with_ties = F)
+) %>%
+    kbl() %>%
+    column_spec (c(4,7,11), extra_css = "padding-left: 20px;border-left-style: solid;border-color: lightgrey;") %>%
+    column_spec (c(3,6,10), extra_css = "padding-right: 20px;") %>%
+    kable_styling(full_width = T, font_size = 11, bootstrap_options = c("striped", "condensed")) %>%
+    add_header_above(
+            c(
+                "Bigrams with Stopwords" = 3, 
+                "Bigrams w/o Stopwords" = 3,
+                "Trigrams with Stopwords" = 4, 
+                "Trigrams w/o Stopwords" = 4
+            )
+        )
+```
+
+-   Frequently occurring bi-gram count: `r format(n_bigram, big.mark=",")` with stop words, `r format(n_bigram_ns, big.mark=",")` without stop words.
+-   Frequently occurring tri-gram count: `r format(n_trigram, big.mark=",")` with stop words, `r format(n_trigram_ns, big.mark=",")` without stop words.
+-   Bigrams have a much higher frequency than trigrams (top trigram counts are approximately 10% of those for bigrams).
+-   N-grams without stopwords have a much lower frequency, particularly trigrams where the highest score (not counting proper nouns) occurred only 265 times in 427K observations (0.06%).
+
+### Relationships Between Words in Bigrams
+
+Plot connections between words with and without stopwords.
+
+```{r 19-plot-ngrams, echo=FALSE}
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+#create map edges
+ngram_graph <- ngram_freq %>%
+    filter(frequency > 3000) %>%
+    graph_from_data_frame()
+ngram_graph_ns <- ngram_freq_ns %>%
+    filter(frequency > 350) %>%
+    graph_from_data_frame()
+
+ngram_graph
+ngram_graph_ns
+
+set.seed(1234)
+
+g <- ggraph(ngram_graph, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = frequency), show.legend = FALSE,
+                   arrow = a, end_cap = circle(.07, 'inches')) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+
+g_ns <- ggraph(ngram_graph_ns, layout = "fr") +
+    geom_edge_link(aes(edge_alpha = frequency), show.legend = FALSE,
+                   arrow = a, end_cap = circle(.07, 'inches')) +
+    geom_node_point(color = "lightblue", size = 5) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+
+g;g_ns
+```
+
+## Feature Co-occurrence Matrix (FCM)
+
+Another useful analysis is to use Collocation Frequency which analyses co-occurrence of words within the document (as opposed to n-grams which only considers adjacent words).
+
+```{r 20-collocation, echo=FALSE}
+collocation_freq <- toks_text %>% textstat_collocations(min_count = 200)
+collocation_freq_ns <- toks_text_no_stop %>% textstat_collocations(min_count = 200)
+cbind(
+    as.data.frame(collocation_freq) %>% 
+        slice_max(order_by = count, n=40) %>%
+        select(collocation, count, length, lambda),
+    as.data.frame(collocation_freq_ns) %>% 
+        slice_max(order_by = count, n=40) %>%
+        select(collocation, count, length, lambda)
+) %>%
+    kbl(row.names = F) %>% 
+    kable_styling(font_size = 10, bootstrap_options = "condensed") %>%
+    add_header_above(
+            c(
+                "Collocations with Stopwords" = 4, 
+                "Collocations without Stopwords" = 4
+            )
+        )
+```
+
+As expected, stop words and bi-grams rate the highest.
+
+Top features in the FCM's:
+
+```{r 21-fcm, echo=FALSE, comment=""}
+fcmat <- fcm(dfmat)
+topfeatures(fcmat,20)
+fcmat_ns <- fcm(dfmat_ns)
+topfeatures(fcmat_ns,20)
+```
+
+Plot relationship between collocating words:
+
+```{r 22-fcm_plot, echo=FALSE}
+set.seed(1234)
+feat <- names(topfeatures(fcmat, 50))
+fcmat_select <- fcm_select(fcmat, pattern = feat, selection = "keep")
+size <- log(colSums(dfm_select(dfmat, feat, selection = "keep")))
+tp <- textplot_network(fcmat_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+feat <- names(topfeatures(fcmat_ns, 50))
+fcmat_select <- fcm_select(fcmat_ns, pattern = feat, selection = "keep")
+size <- log(colSums(dfm_select(dfmat_ns, feat, selection = "keep")))
+tp_ns <- textplot_network(fcmat_select, min_freq = 0.8, vertex_size = size / max(size) * 3)
+tp;tp_ns
+```
+
+## Term Frequency - Inverse Document Frequency (TF-IDF)
+
+The statistic tf-idf is intended to measure how important a word is to a document in a collection (or corpus) of documents, for example, to one novel in a collection of novels or to one website in a collection of websites.
+
+### Term Frequency Calculation
+
+Looking at the data split by source to see if there is much change in word importance, there is a similar distribution across all sources.
+
+```{r 23-tf, fig.height=3, echo=FALSE}
+data(stop_words)
+
+tokens <- train %>%
+    unnest_tokens(word, text)
+
+tokens_ns <- tokens %>%
+    anti_join(stop_words)
+
+source_words <- tokens %>% count(source, word, sort = T)
+source_words_ns <- tokens_ns %>% count(source, word, sort = T)
+
+source_total <- source_words %>% group_by(source) %>% summarise(total = sum(n))
+source_total_ns <- source_words_ns %>% group_by(source) %>% summarise(total = sum(n))
+
+source_words <- left_join(source_words, source_total)
+source_words_ns <- left_join(source_words_ns, source_total_ns)
+
+gg.tf <- ggplot(source_words, aes(n/total, fill = source)) +
+    geom_histogram(show.legend = FALSE, bins=25) +
+    facet_wrap(~source, ncol = 3, scales = "free_y") +
+    scale_x_log10(limits=c(NA, 0.0009)) +
+    ggtitle("Term Frequency Distribution by Source (Log Base 10 Scale)") +
+    theme_minimal()
+
+gg.tfns <- ggplot(source_words_ns, aes(n/total, fill = source)) +
+    geom_histogram(show.legend = FALSE, bins=25) +
+    facet_wrap(~source, ncol = 3, scales = "free_y") +
+    scale_x_log10(limits=c(NA, 0.0009)) + 
+    ggtitle("Term Frequency without Stop Words Distribution by Source (Log Base 10 Scale)") +
+    theme_minimal()
+
+gg.tf; gg.tfns;
+```
+
+### Zipf's law
+
+Zipf's law states that the frequency that a word appears is inversely proportional to its rank.
+
+```{r 24-zipf, echo=FALSE}
+freq_by_rank <- source_words %>% 
+    group_by(source) %>% 
+    mutate(rank = row_number(), 
+           `term frequency` = n/total) %>%
+    ungroup()
+
+freq_by_rank_ns <- source_words %>% 
+    group_by(source) %>% 
+    mutate(rank = row_number(), 
+           `term frequency` = n/total) %>%
+    ungroup()
+
+freq_by_rank %>% 
+    ggplot(aes(rank, `term frequency`, colour=source)) + 
+    geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+    scale_x_log10() +
+    scale_y_log10() +
+    theme_minimal()
+```
+
+Plots for the three sources are nearly identical.
+
+There is a near log-linear relationship over much of the distribution as predicted by Zipf's Law.
+
+Finding the linear relationship for ranks from 10 to 10000:
+
+```{r 25-zipf-lm, echo=FALSE}
+rank_subset <- freq_by_rank %>% 
+    filter(rank < 10000,
+           rank > 10)
+
+zipflm <- coef(lm(log10(`term frequency`) ~ log10(rank), data = rank_subset))
+zipflm
+
+freq_by_rank %>% 
+    ggplot(aes(rank, `term frequency`, colour=source)) + 
+    geom_abline(intercept = zipflm[1], slope = zipflm[2], 
+                color = "gray50", linetype = 2) +
+    geom_line(size = 1.1, alpha = 0.8, show.legend = FALSE) + 
+    scale_x_log10() +
+    scale_y_log10() +
+    theme_minimal()
+```
+
+### TF-IDF
+
+Find Words with Highest TF-IDF Score:
+
+```{r 26-tf-idf, echo=FALSE}
+source_tf_idf <- source_words %>%
+    bind_tf_idf(word, source, n)
+
+source_tf_idf %>%
+    group_by(source) %>%
+    slice_max(tf_idf, n = 25) %>%
+    ungroup() %>%
+    ggplot(aes(tf_idf, fct_reorder(word, tf_idf), fill = source)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~source, ncol = 3, scales = "free") +
+    labs(x = "tf-idf", y = NULL)
+```
+
+Interesting to note, the highest ranking words for Twitter are mostly "junk" words not found in a standard English dictionary.
+
+## Analysing Language
+
+The English dictionary from the `hunspell` package is loaded and tokens filtered by dictionary words only.
+
+```{r 27-en-dict}
+# read US English Dictinary
+english_words <- readLines("./data/dict/en_US.dic") %>% gsub("/.+", "", .)
+n_dict <- length(english_words)
+
+# filter DFM by English US dictionary words
+dfmat_en <- toks_text %>%
+    tokens_keep(english_words, valuetype = "fixed") %>% 
+    dfm()
+
+# Use text stat frequency to obtain a list of unique words
+word_freq <- textstat_frequency(dfmat)
+word_freq_en <- textstat_frequency(dfmat_en)
+
+# Proportion of sample in US English dictionary
+pdict <- sum(word_freq_en$frequency)/sum(word_freq$frequency)
+
+# Proportion of US English dictionary words captured in sample
+pcapture <- nrow(word_freq_en)/n_dict
+```
+
+`r round(100*pdict,1)`% of words in the sample are recognised in the US English dictionary (comprising of `r format(n_dict, big.mark=",")` word definitions). The remaining `r round(100*(1-pdict),1)`% will be a mixture of foreign words, abbreviations, shorthand, mispellings and unrecognised slang. Determining the proportion of these that are actually foreign words would require a significant amount of processing.
+
+`r round(100*pcapture,1)`% of the words appearing in the US English dictionary are captured by a 10% sample. To capture 90% of vocabulary would likely require a far greater sample as frequency of usage of remaining words becomes increasingly rare.
+
+Everyday words are a much smaller subset of the full dictionary vocabulary however.
+
+> "In English, for example, 3000 words make up about 95% of everyday conversation"[^1]
+
+[^1]: <https://www.fluentu.com/blog/how-many-words-do-i-need-to-know/>
+
+There are `r format(nrow(word_freq_en), big.mark=",")` US English words captured in the sample. Using 3000 as an estimate of common usage vocabulary, it is very likely that nearly all are captured by the sample.
+
+Using the [Top 3000 Words list from Education First](https://www.ef.co.uk/english-resources/english-vocabulary/top-3000-words/):
+
+```{r 28-en-common}
+# read English common usage Dictinary
+common_words <- readLines("./data/dict/en_common.dic") %>% gsub("/.+", "", .)
+
+# filter DFM by common English words
+dfmat_common <- toks_text %>%
+    tokens_keep(common_words, valuetype = "fixed") %>% 
+    dfm()
+
+# Use text stat frequency to obtain a list of unique words
+word_freq_common <- textstat_frequency(dfmat_common)
+
+# Proportion of sample in common usage list
+pdict <- sum(word_freq_common$frequency)/sum(word_freq$frequency)
+
+# Proportion of common usage words captured in sample
+pcapt <- nrow(word_freq_common)/length(common_words)
+```
+
+The 10% sample captures `r round(100*pcapt,1)`% of common usage words, `r round(100*pdict,1)`% of the content is in the English common usage list.
+
+Below is an estimation of the required sample size to meet common vocabulary coverage. Rather than looking at the required number of words to be sampled, the document frequency count is used to estimate the number of documents (text samples) that would need to be sampled to achieve coverage.
+
+```{r 29-coverage, echo=FALSE}
+token_coverage <- function(word_cover) {  
+    count <- 0 
+    coverage <- word_cover * sum(word_freq_common$docfreq) 
+    for (n in 1:nrow(word_freq_common)) { 
+        if (count >= coverage) {
+            return (n)
+        } else {
+            count <- count + word_freq_common$docfreq[n]
+        }
+    }
+}
+
+# Estimate number of observations required to sample 50% of common words
+p50 <- token_coverage(.5)
+# Estimate number of observations required to sample 90% of common words
+p90 <- token_coverage(.9)
+
+token_coverage_v <- Vectorize(token_coverage)
+tibble(Coverage = seq(0.05, 0.95, by = 0.05)) %>%
+    mutate(Samples = token_coverage_v(Coverage)) %>%
+    ggplot(aes(x=100*Coverage, y=Samples)) +
+    geom_point(colour="blue", size=3) +
+    geom_smooth(method = "loess", se = FALSE, span=0.4) +
+    theme_minimal() +
+    ylab("Required Sample Size") + xlab("Coverage (%)") +
+    ggtitle("Samples Required to Meet Common Vocabulary Coverage") +
+    geom_vline(xintercept = c(50,90), linetype="dashed", alpha=0.7)
+```
+
+-   Samples required to capture 50% of common usage words: `r p50`
+-   Samples required to capture 90% of common usage words: `r p90`
+-   The number of samples required grows exponentially with coverage required.
+
+While this looks at word capture rate, n-gram capture rate significantly drops off for lower sample sizes.
+
+## EDA Summary
+
+Analysis of a 10% sample of the source data consisting of 426,714 examples of blog, news & Twitter items produced the following findings:
+
+-   82.8% of words used were found in the US English dictionary, 68.7% coming from the 3000 most used words in English. The sample covers 68% of the US English dictionary and 98.2% of the 3000 most used words.
+-   The sample produces `r format(unique_words, big.mark=",")` unique words with `r format(22309373296, big.mark=",")` possible bi-grams and `r format(1.5708252831447E+15, big.mark=",", scientific = FALSE)` possible tri-grams.
+-   `r format(n_bigram, big.mark=",")` bi-grams occurring at least 40 times were found, and `r format(n_trigram, big.mark=",")` tri-grams with a frequency of at least 25.
+
+## Further Thoughts
+
+-   Even with a sample size of 426,714, the number of encountered tri-grams is relatively low.
+-   Vectorising the vocabulary in the model will be necessary (words are indexed and represented as digits).
+-   Constructing a probability matrix of expected n-grams is not feasible as the memory required for such a matrix would run into hundreds of gigabytes (a test of a vectorised feature sequence matrix on only 11,000 words needed 176GB memory).
+-   Basic n-gram matrices do not take unknown words into consideration, some form of algorithm to deal with this is required.
+
+```{r 30-cleanup, include=FALSE}
+# drop objects from memory other than the train dataset
+rm(a, all_text, clean_text, collocation_freq, collocation_freq_ns,
+   common_words, corp_text, dfmat, dfmat_common, dfmat_en, dfmat_ngram,
+   dfmat_ngram_ns, dfmat_ns, english_words, fcmat, fcmat_ns, fcmat_select,
+   feat, freq_by_rank, freq_by_rank_ns, g, g_ns, gg.tf, gg.tfns, i, n_blogs,
+   n_dict, n_news, n_tweets, n_words, n_words_ns, ngram_freq, ngram_freq_ns,
+   ngram_graph, ngram_graph_ns, p50, p90, pcapt, pcapture, pdict,
+   profanityList, rank_subset, remove_pattern, replace_pattern, size,
+   source_tf_idf, source_total, source_total_ns, source_words,
+   source_words_ns, stop_words, summ, test, token_coverage, 
+   token_coverage_v, tokens, tokens_ns, toks_ngram, toks_ngram_ns, 
+   toks_text, toks_text_no_stop, tp, tp_ns, unique_words,
+   unique_words_ns, validation, word_freq, word_freq_common, word_freq_en,
+   word_freq_ns, zipflm)
+gc()
+```
+
+# Creating a Prediction Algorithm
+
+## Trialled Model Types
+
+### Long Short-term Memory (LTSM)
+
+Long short-term memory (LSTM) is an artificial recurrent neural network (RNN) architecture available in R through the Tensor Flow Keras package.
+
+The huge advantage of the RNN models is that they use unsupervised learning to take past choices into account, including new vocabulary terms to build a smart, personalised self-teaching model.
+
+I had high hopes for this but quickly ran into memory issues when trying to build the feature matrix for any sample over a few thousand sentences. A Windows laptop is not the right environment for this pursuit, neither is R, where both have tight restrictions on memory usage.
+
+Most text prediction using this model is character based rather than word based and has a tendency to produce nonsense words.
+
+Of the few working models I managed, training the model in small batches, prediction accuracy was low, memory usage high and response times too long to be considered practical.
+
+Final nail in the coffin for this approach was the discovery that the Shiny Apps servers do not support Keras.
+
+### Markov-Chain with Katz's Back-off
+
+This route similarly has memory issues, and still requires large scale n-gram and skip-gram matrices taking too much memory and in the end, not producing great results - 33% prediction rate was the best I saw here and not so quick to respond.
+
+### Stupid Back-off Model
+
+Markov models are the class of probabilistic models that assume we can predict the probability of some future unit without looking too far into the past. Stupid back-off is a smoothing model does away with the need to store vast amounts of probabilistic data and instead uses direct relative frequencies. Katz's Back-off may require up to 4 searches and calculations per request while the Stupid Back-off will only ever require one and making use of pre-compiled C++ code, the execution time is much quicker.
+
+Stupid back-off takes care of unknown words by splitting chains in to linked segments thus getting rid of the need for skip-grams.
+
+In terms of accuracy, my first model (below) was trained on a 5% sample using default parameters gave me a 46% accuracy and typical response time of 2.5ms.
+
+## Testing the Initial Model
+
+For training the initial model, the train data is split 50-50 to give a 5% sample of the original data source. It is then split into sentences, stripped of any excess whitespace and any sentences shorter than 4 words are removed (since our aim to predict on the previous 3 words.
+
+```{r 31-sbo-prep}
+set.seed(1234)
+train_intial <- rbind(
+    train %>% filter(source=='news') %>% sample_frac(.5),
+    train %>% filter(source=='blog') %>% sample_frac(.5),
+    train %>% filter(source=='twitter') %>% sample_frac(.5)
+)
+
+# clean the sample data set
+data <-  rbind(
+    train %>% filter(source=='news') %>% sample_frac(.5),
+    train %>% filter(source=='blog') %>% sample_frac(.5),
+    train %>% filter(source=='twitter') %>% sample_frac(.5)
+) %>% 
+    # split observations into sentences
+    unnest_tokens(sentence, text, token = "sentences") %>%
+    # strip[ trailing full stop and remove excess whitespace
+    mutate(sentence = str_squish(str_remove_all(sentence, '\\.'))) %>%
+    # keep only sentences with 4 or more words (since we are predicting on 3 words)
+    filter(str_count(sentence, '\\w+') > 3) 
+
+data <- unlist(data[, 'sentence'])
+```
+
+Next, an SBO predictor table is trained with 4-grams, a target of 75% coverage of the source vocabulary and a lambda penalization of 0.4. A predictor model is generated from that table.
+
+```{r 32-sbo-pred, include=FALSE}
+require(sbo)
+sbo.model <- sbo_predtable(
+    object = data, # preloaded example dataset
+    N = 4, # Train a 3-gram model
+    dict = target ~ 0.75, # cover 75% of training corpus
+    .preprocess = sbo::preprocess, # Preprocessing transformation 
+    EOS = "", # End-Of-Sentence tokens ignored, alrady cleaned
+    lambda = 0.4, # Back-off penalization in SBO algorithm
+    L = 3L, # Number of predictions for input
+    filtered = "<UNK>" # Exclude the <UNK> token from predictions
+)
+if (!dir.exists("./data/model")) {
+  dir.create("./data/model")
+}
+save(sbo.model, file = './data/model/sbo.model.rData')
+gc()
+```
+
+Below, we show some example predictions and also test the memory allocation and amount of time to respond:
+
+```{r 33-sbo-demo, comment="", echo=FALSE}
+load('./data/model/sbo.model.rData')
+sbo.pred <- sbo_predictor(sbo.model)
+
+test1 <- "information about the"
+test2 <- "i'd like to"
+test3 <- "they wanted to"
+paste(test1, "[", str_c(predict(sbo.pred, test1), collapse = ', '), ']')
+paste(test2, "[", str_c(predict(sbo.pred, test2), collapse = ', '), ']')
+paste(test3, "[", str_c(predict(sbo.pred, test3), collapse = ', '), ']')
+
+# Model size
+paste("Model Memory Allocation: ", round(as.numeric(object.size(sbo.model))/1024/1024,1), "MB")
+# Response time
+library(rbenchmark)
+benchmark(
+    "Test1" = {
+        X <- predict(sbo.pred, test1)
+    },
+    "Test2" = {
+        X <- predict(sbo.pred, test2)
+    },
+    "Test3" = {
+        X <- predict(sbo.pred, test3)
+    },
+    replications = 1000,
+    columns = c("test", "replications", "elapsed",
+                "relative", "user.self", "sys.self")
+) %>% 
+    kbl() %>%
+    kable_styling(full_width = F, bootstrap_options = "condensed", position = "left")
+```
+
+Note, there are 1000 replications in the above benchmark test, the times displayed above can be thought of as the average time for each request in milliseconds.
+
+Evaluating the accuracy for in-sample data:
+
+```{r 34-sbo-eval, echo=FALSE}
+load('./data/model/sbo.model.rData')
+sbo.pred <- sbo_predictor(sbo.model)
+
+(evaluation <- eval_sbo_predictor(sbo.pred, test = data))
+
+evaluation %>% summarise(
+    accuracy = sum(correct)/n(), 
+    uncertainty = sqrt(accuracy * (1 - accuracy) / n()
+    )
+)
+```
+
+```{r 35-sbo-eval-g, echo=FALSE}
+evaluation %>%
+    filter(correct, true != "<EOS>") %>%
+    select(true) %>%
+    transmute(rank = match(true, table = attr(sbo.pred, "dict"))) %>%
+    ggplot(aes(x = rank)) + 
+    geom_histogram(bins=50, fill="orange", colour="#ff8c00", alpha = 0.8) +
+    theme_minimal() + 
+    ggtitle("Correct Predictions by Word Rank")
+
+```
+
+## Considerations for Improvement
+
+There are several avenues to explore to improve model accuracy and performance:
+
+-   Consider training the data with news and blog data only - the Twitter data tends to contain a lot of slang and abbreviations that could be inflating the vocabulary size.
+-   Trial a larger sample size and also greater target dictionary coverage.
+-   Test different values for the penalty value lambda.
+-   Detect end-of-sentence punctuation in the user input and capitalize suggestions where appropriate.
+
+Ideal improvements beyond the scope of this project:
+
+-   Self-learning dictionary with weighting for user defined words and previously selected predictions.
+
+# References
+
+[@quanteda]
+
+[\@quanteda.textplots]
+
+[@tidytext]
+
+[@sbo]
+
+[Large Language Models in Machine Translation](https://aclanthology.org/D07-1090.pdf)
+
+[N-gram Language Models](https://web.stanford.edu/~jurafsky/slp3/3.pdf)
+
+[Backoff Inspired Features for Maximum Entropy Language Models](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/43114.pdf)
+
+------------------------------------------------------------------------
