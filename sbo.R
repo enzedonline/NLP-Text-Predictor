@@ -5,10 +5,18 @@ require(tidytext)
 attach('./data/processed/project.Rdata')
 
 # clean the sample data set
-data <- text_sample %>% 
+data <- train %>% 
     # split observations into sentences
     unnest_tokens(sentence, text, token = "sentences") %>%
     # strip[ trailing full stop and remove excess whitespace
+    mutate(sentence = str_squish(str_remove_all(sentence, '\\.'))) %>%
+    # keep only sentences with 4 or more words (since we are predicting on 3 words)
+    filter(str_count(sentence, '\\w+') > 3) 
+
+valid_data <- validation %>% 
+    # split observations into sentences
+    unnest_tokens(sentence, text, token = "sentences") %>%
+    # strip trailing full stop and remove excess whitespace
     mutate(sentence = str_squish(str_remove_all(sentence, '\\.'))) %>%
     # keep only sentences with 4 or more words (since we are predicting on 3 words)
     filter(str_count(sentence, '\\w+') > 3) 
@@ -33,15 +41,18 @@ gc()
 
 require(sbo)
 require(tidyverse)
-load('./sbo.model.rData')
-
+load('./data/model/sbo.model.rData')
+load('./data/model/sbo.model.data.rData')
 sbo.pred <- sbo_predictor(sbo.model)
 
 predict(sbo.pred, "information about the")
 
 (evaluation <- eval_sbo_predictor(sbo.pred, test = unlist(data[, 'sentence'] )))
+(evaluation <- eval_sbo_predictor(sbo.pred, test = unlist(valid_data[, 'sentence'] )))
 
-evaluation %>% summarise(
+evaluation %>% 
+    filter(true != "<EOS>") %>% 
+    summarise(
     accuracy = sum(correct)/n(), 
     uncertainty = sqrt(accuracy * (1 - accuracy) / n()
     )
@@ -62,7 +73,8 @@ evaluation %>%
     ggplot(aes(x = rank)) + 
     geom_histogram(fill="orange", colour="#ff8c00", alpha = 0.8) +
     scale_x_log10() +
-    theme_minimal()
+    theme_minimal() +
+    ggtitle("Correct Prediction by Word Rank")
 
 # Word coverage
 
